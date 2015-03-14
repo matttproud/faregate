@@ -8,8 +8,10 @@ import (
 
 // option captures the accumulated state for the Faregate's configuration.
 type option struct {
-	TokenCount      uint64
-	RefreshInterval time.Duration
+	TokenCount       uint64
+	RefreshInterval  time.Duration
+	TokenPer         time.Duration
+	ConcurrencyLevel uint8
 }
 
 //optionFn applies a configuration to the option.
@@ -36,6 +38,15 @@ func TokenCount(c uint64) optionFn {
 	}
 }
 
+// ConcurrencyLevel sets how many concurrent token operations to support without
+// blocking.
+func ConcurrencyLevel(l uint8) optionFn {
+	return func(o *option) error {
+		o.ConcurrencyLevel = l
+		return nil
+	}
+}
+
 var errIllegalRefreshInt = errors.New("faregate: illegal refresh interval")
 
 func newOption(opts ...optionFn) (*option, error) {
@@ -51,6 +62,7 @@ func newOption(opts ...optionFn) (*option, error) {
 	if opt.RefreshInterval == 0 {
 		return nil, errIllegalRefreshInt
 	}
+	opt.TokenPer = opt.RefreshInterval / time.Duration(opt.TokenCount)
 	return &opt, nil
 }
 
@@ -63,7 +75,8 @@ type Faregate struct {
 	quit            chan struct{} // termination channel.
 }
 
-// New creates a Faregate from the options.
+// New creates a Faregate from the options.  It must be closed when no longer
+// needed to prevent leakage of goroutines.
 func New(opts ...optionFn) (*Faregate, error) {
 	opt, err := newOption(opts...)
 	if err != nil {
@@ -72,8 +85,8 @@ func New(opts ...optionFn) (*Faregate, error) {
 	gate := &Faregate{
 		refreshQuantity: opt.TokenCount,
 		quantity:        opt.TokenCount,
-		tick:            time.NewTicker(opt.RefreshInterval),
-		ops:             make(chan *op),
+		tick:            time.NewTicker(opt.TokenPer),
+		ops:             make(chan *op, opt.ConcurrencyLevel),
 		quit:            make(chan struct{}),
 	}
 	go gate.serve()
@@ -98,8 +111,13 @@ func (f *Faregate) serve() {
 		for {
 			switch {
 			case backChan == nil:
-				queue = append(queue, <-backlog)
-				backChan = f.ops
+				select {
+				case b := <-backlog:
+					queue = append(queue, b)
+					backChan = f.ops
+				case <-f.quit:
+					return
+				}
 			default:
 				select {
 				case b := <-backlog:
@@ -109,6 +127,8 @@ func (f *Faregate) serve() {
 					if len(queue) == 0 {
 						backChan = nil
 					}
+				case <-f.quit:
+					return
 				}
 			}
 		}
@@ -118,7 +138,9 @@ func (f *Faregate) serve() {
 		case <-f.quit:
 			return
 		case <-f.tick.C:
-			f.quantity = f.refreshQuantity
+			if f.quantity < f.refreshQuantity {
+				f.quantity++
+			}
 		case r := <-f.ops:
 			switch {
 			case r.count > f.quantity:
@@ -131,7 +153,7 @@ func (f *Faregate) serve() {
 	}
 }
 
-// Close stops the Faregate.
+// Close stops the Faregate.  It should be called only once.
 func (f *Faregate) Close() {
 	close(f.quit)
 }
